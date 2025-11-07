@@ -38,6 +38,7 @@ The Go program requires the following environment variables to be set before run
 | Variable | Description |
 | :---- | :---- |
 | **GEMINI\_API\_KEY** | Your API key for accessing the Google Gemini API. |
+|**RESUME_FILE_PATH**| Path to .txt file containing your resume information. |
 
 **Example (.env file content):**
 
