@@ -55,6 +55,8 @@ setTimeout(function(){
                 return true;
             } else {
                 console.error("The clickable link element was not found inside the first job listing.");
+                jobIndex++
+                openJob()
                 return false;
             }
         }
