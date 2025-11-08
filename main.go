@@ -1,14 +1,14 @@
 package main
 
 import (
+	"bytes" // New import for handling JSON request body
 	"context"
 	"encoding/json"
-	"flag" // New import for command-line flags
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/exec" // New import for shelling out
 	"strings"
 	"time"
 
@@ -83,8 +83,9 @@ May 2014)
 `
 
 // Model configuration constants
-const localModelName = "deepseek-r1"
+const localModelName = "gemma3:270m"
 const geminiModelName = "gemini-2.5-flash"
+const ollamaAPIUrl = "http://localhost:11434/api/generate" // Ollama's default API endpoint
 
 // Struct for incoming JSON request from the browser extension
 type AnalyzeRequest struct {
@@ -94,6 +95,19 @@ type AnalyzeRequest struct {
 // Struct for outgoing JSON response to the browser extension
 type AnalyzeResponse struct {
 	JSCode string `json:"jsCode"`
+}
+
+// Struct for making POST request to Ollama API
+type OllamaRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Stream bool   `json:"stream"`
+}
+
+// Struct for parsing the JSON response from Ollama API
+type OllamaResponse struct {
+	Response string `json:"response"`
+	// Other fields like 'model', 'created_at', 'done' are ignored
 }
 
 type AppServer struct {
@@ -137,14 +151,37 @@ func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 	prompt := buildPrompt(req.HTML)
 
 	// 3. Call AI
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	var rawResponse string
 	var err error
 
 	if s.useLocalModel {
-		log.Printf("Sending prompt to local Ollama model (%s)...", localModelName)
+		log.Printf("Sending prompt to local Ollama API (%s) at %s...", localModelName, ollamaAPIUrl)
+
+		// --- DEBUGGING: LOG CURL COMMAND ---
+		ollamaReqBody := OllamaRequest{
+			Model:  localModelName,
+			Prompt: "---",
+			Stream: false,
+		}
+		jsonData, _ := json.Marshal(ollamaReqBody)
+
+		// Escape quotes in the JSON string for safe inclusion in the shell command
+		jsonString := strings.ReplaceAll(string(jsonData), "\"", "\\\"")
+
+		// Log the reusable curl command
+		curlCommand := fmt.Sprintf(
+			"curl -X POST %s -d \"%s\"",
+			ollamaAPIUrl,
+			jsonString,
+		)
+		log.Println("\n--- DEBUG CURL COMMAND ---")
+		log.Println(curlCommand)
+		log.Println("--------------------------")
+		// ------------------------------------
+
 		rawResponse, err = s.generateContentLocal(ctx, prompt)
 	} else {
 		log.Printf("Sending prompt to Gemini API (%s)...", geminiModelName)
@@ -180,26 +217,47 @@ func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// generateContentLocal executes the Ollama CLI to generate content.
+// generateContentLocal executes an HTTP POST request to the local Ollama API endpoint.
 func (s *AppServer) generateContentLocal(ctx context.Context, prompt string) (string, error) {
-	// The command is: ollama run deepseek-r1 "<prompt content>"
-	// Note: The prompt is passed as the last argument, which is what the Ollama CLI expects.
-	cmd := exec.CommandContext(ctx, "ollama", "run", localModelName, prompt)
-
-	// Execute the command and capture combined stdout/stderr
-	// CombinedOutput is used because Ollama often prints setup/status messages to stderr
-	// but the final response text to stdout.
-	output, err := cmd.CombinedOutput()
-	outputString := strings.TrimSpace(string(output))
-
-	if err != nil {
-		// If the command failed, return the error along with the output for debugging
-		log.Printf("Ollama Execution Error: %s", outputString)
-		return outputString, fmt.Errorf("ollama execution failed: %w", err)
+	reqBody := OllamaRequest{
+		Model:  localModelName,
+		Prompt: prompt,
+		Stream: false, // Wait for the entire response
 	}
 
-	// Ollama's output is the raw model response.
-	return outputString, nil
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal Ollama request: %w", err)
+	}
+
+	// Create the HTTP request with context
+	req, err := http.NewRequestWithContext(ctx, "POST", ollamaAPIUrl, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request to Ollama: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request
+	// Set a client timeout slightly shorter than the context timeout for robustness
+	client := &http.Client{ /*Timeout: 90 * time.Second*/ }
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to Ollama API at %s. Is Ollama running?: %w", ollamaAPIUrl, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Ollama API returned non-OK status: %s", resp.Status)
+	}
+
+	// Decode the response
+	var ollamaResp OllamaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to decode Ollama response: %w", err)
+	}
+
+	// The raw response text is inside the 'response' field of the Ollama response JSON
+	return ollamaResp.Response, nil
 }
 
 func buildPrompt(modalHTML string) string {
@@ -281,12 +339,8 @@ func main() {
 		}
 	} else {
 		// --- OLLAMA SETUP ---
-		log.Println("--- WARNING: Using local Ollama model 'deepseek-r1' via shell execution ---")
-		log.Println("Ensure Ollama is running and the model is pulled (`ollama pull deepseek-r1`).")
-		// Check if ollama is accessible
-		if _, err := exec.LookPath("ollama"); err != nil {
-			log.Fatalf("Ollama executable not found in PATH: %v. Please install Ollama or ensure it's accessible.", err)
-		}
+		log.Println("--- WARNING: Using local Ollama model 'deepseek-r1' via API endpoint ---")
+		log.Printf("Ensure Ollama is running and accessible at %s.", ollamaAPIUrl)
 	}
 
 	// Load Resume File Path if set
