@@ -346,7 +346,7 @@ func main() {
 		}
 	} else {
 		// --- OLLAMA SETUP ---
-		log.Println("--- WARNING: Using local Ollama model 'deepseek-r1' via API endpoint ---")
+		log.Printf("--- WARNING: Using local Ollama model '%s' via API endpoint ---", localModelName)
 		log.Printf("Ensure Ollama is running and accessible at %s.", ollamaAPIUrl)
 	}
 
