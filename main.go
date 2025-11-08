@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag" // New import for command-line flags
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/exec" // New import for shelling out
 	"strings"
 	"time"
 
@@ -16,7 +18,6 @@ import (
 
 // --- CONFIGURATION ---
 // !! REPLACE THIS WITH YOUR ACTUAL RESUME TEXT !!
-// You could also read this from a file.
 var resumeText = `
 ---------------------
 Cheikh Diagne Seck
@@ -81,6 +82,10 @@ May 2014)
 ---------------------
 `
 
+// Model configuration constants
+const localModelName = "deepseek-r1"
+const geminiModelName = "gemini-2.5-flash"
+
 // Struct for incoming JSON request from the browser extension
 type AnalyzeRequest struct {
 	HTML string `json:"html"`
@@ -92,13 +97,13 @@ type AnalyzeResponse struct {
 }
 
 type AppServer struct {
-	geminiModel *genai.GenerativeModel
+	geminiModel   *genai.GenerativeModel // Only initialized if !useLocalModel
+	useLocalModel bool
 }
 
 // aiapplyHandler handles the core logic
 func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 	// --- CORS Handling (CRITICAL for ngrok) ---
-	// This allows your browser extension (on linkedin.com) to talk to your ngrok URL
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -128,32 +133,44 @@ func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Build the prompt for Gemini
-	// This is the most important part. It needs to be very specific.
+	// 2. Build the prompt for the AI
 	prompt := buildPrompt(req.HTML)
 
-	// 3. Call Gemini API
+	// 3. Call AI
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	log.Println("Sending prompt to Gemini API...")
+	var rawResponse string
+	var err error
 
-	resp, err := s.geminiModel.GenerateContent(ctx, genai.Text(prompt))
+	if s.useLocalModel {
+		log.Printf("Sending prompt to local Ollama model (%s)...", localModelName)
+		rawResponse, err = s.generateContentLocal(ctx, prompt)
+	} else {
+		log.Printf("Sending prompt to Gemini API (%s)...", geminiModelName)
+		resp, geminiErr := s.geminiModel.GenerateContent(ctx, genai.Text(prompt))
+		if geminiErr != nil {
+			err = geminiErr
+		} else {
+			rawResponse = extractRawTextFromGemini(resp)
+		}
+	}
+
 	if err != nil {
 		log.Printf("Error generating content: %v", err)
 		http.Error(w, "Failed to get response from AI", http.StatusInternalServerError)
 		return
 	}
 
-	// 4. Extract the JavaScript code from the response
-	jsCode := extractJSFromResponse(resp)
+	// 4. Extract and clean the JavaScript code from the raw response
+	jsCode := extractJSFromRawText(rawResponse)
 	if jsCode == "" {
 		log.Println("AI did not return any usable content.")
 		http.Error(w, "AI did not return usable code", http.StatusInternalServerError)
 		return
 	}
 
-	log.Println("Received JS code from Gemini. Sending to client.", jsCode)
+	log.Println("Received JS code from AI. Sending to client.")
 
 	// 5. Send the JavaScript code back to the extension
 	res := AnalyzeResponse{JSCode: jsCode}
@@ -161,6 +178,28 @@ func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// generateContentLocal executes the Ollama CLI to generate content.
+func (s *AppServer) generateContentLocal(ctx context.Context, prompt string) (string, error) {
+	// The command is: ollama run deepseek-r1 "<prompt content>"
+	// Note: The prompt is passed as the last argument, which is what the Ollama CLI expects.
+	cmd := exec.CommandContext(ctx, "ollama", "run", localModelName, prompt)
+
+	// Execute the command and capture combined stdout/stderr
+	// CombinedOutput is used because Ollama often prints setup/status messages to stderr
+	// but the final response text to stdout.
+	output, err := cmd.CombinedOutput()
+	outputString := strings.TrimSpace(string(output))
+
+	if err != nil {
+		// If the command failed, return the error along with the output for debugging
+		log.Printf("Ollama Execution Error: %s", outputString)
+		return outputString, fmt.Errorf("ollama execution failed: %w", err)
+	}
+
+	// Ollama's output is the raw model response.
+	return outputString, nil
 }
 
 func buildPrompt(modalHTML string) string {
@@ -196,62 +235,86 @@ JAVASCRIPT CODE:
 `, resumeText, modalHTML)
 }
 
-func extractJSFromResponse(resp *genai.GenerateContentResponse) string {
+// Extracts the raw text string from the Gemini response.
+func extractRawTextFromGemini(resp *genai.GenerateContentResponse) string {
 	if resp == nil || resp.Candidates == nil || len(resp.Candidates) == 0 {
 		return ""
 	}
 	part := resp.Candidates[0].Content.Parts[0]
 	if txt, ok := part.(genai.Text); ok {
-		// Clean the response
-		jsCode := string(txt)
-		// Remove markdown backticks if the AI includes them
-		jsCode = strings.TrimSpace(jsCode)
-		if strings.HasPrefix(jsCode, "```javascript") {
-			jsCode = strings.TrimPrefix(jsCode, "```javascript")
-			jsCode = strings.TrimSuffix(jsCode, "```")
-		} else if strings.HasPrefix(jsCode, "```") {
-			jsCode = strings.TrimPrefix(jsCode, "```")
-			jsCode = strings.TrimSuffix(jsCode, "```")
-		}
-		return strings.TrimSpace(jsCode)
+		return string(txt)
 	}
 	return ""
 }
 
-func main() {
-	// 1. Get Gemini API Key
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		log.Fatal("GEMINI_API_KEY environment variable not set")
+// Cleans the raw text response by removing markdown wrappers (used for both models).
+func extractJSFromRawText(rawText string) string {
+	// Clean the response
+	jsCode := rawText
+	// Remove markdown backticks if the AI includes them
+	jsCode = strings.TrimSpace(jsCode)
+
+	// Handle common markdown wrappers (```javascript, ```)
+	if strings.HasPrefix(jsCode, "```javascript") {
+		jsCode = strings.TrimPrefix(jsCode, "```javascript")
+		jsCode = strings.TrimSuffix(jsCode, "```")
+	} else if strings.HasPrefix(jsCode, "```") {
+		jsCode = strings.TrimPrefix(jsCode, "```")
+		jsCode = strings.TrimSuffix(jsCode, "```")
 	}
 
-	resumeFile := os.Getenv("RESUME_FILE_PATH")
+	// Final trim
+	return strings.TrimSpace(jsCode)
+}
 
-	if resumeFile != "" {
+func main() {
+	// Command-line flag definition
+	useLocalModelPtr := flag.Bool("local-model", false, "Use local Ollama model (deepseek-r1) instead of Gemini.")
+	flag.Parse()
 
-		resData, err := os.ReadFile(resumeFile)
-
-		if err != nil {
-			log.Fatalf("Error finding resume data: %s", err)
+	// 1. Conditional Configuration
+	if !*useLocalModelPtr {
+		// --- GEMINI SETUP ---
+		apiKey := os.Getenv("GEMINI_API_KEY")
+		if apiKey == "" {
+			log.Fatal("GEMINI_API_KEY environment variable not set. Please set it or run with '-local-model'.")
 		}
+	} else {
+		// --- OLLAMA SETUP ---
+		log.Println("--- WARNING: Using local Ollama model 'deepseek-r1' via shell execution ---")
+		log.Println("Ensure Ollama is running and the model is pulled (`ollama pull deepseek-r1`).")
+		// Check if ollama is accessible
+		if _, err := exec.LookPath("ollama"); err != nil {
+			log.Fatalf("Ollama executable not found in PATH: %v. Please install Ollama or ensure it's accessible.", err)
+		}
+	}
 
+	// Load Resume File Path if set
+	resumeFile := os.Getenv("RESUME_FILE_PATH")
+	if resumeFile != "" {
+		resData, err := os.ReadFile(resumeFile)
+		if err != nil {
+			log.Fatalf("Error finding resume data at %s: %s", resumeFile, err)
+		}
 		resumeText = string(resData)
 	}
 
-	// 2. Initialize Gemini Client
-	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
-	if err != nil {
-		log.Fatalf("Failed to create Gemini client: %v", err)
+	// 2. Initialize Client Conditionally
+	var geminiModel *genai.GenerativeModel
+	if !*useLocalModelPtr {
+		ctx := context.Background()
+		client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GEMINI_API_KEY")))
+		if err != nil {
+			log.Fatalf("Failed to create Gemini client: %v", err)
+		}
+		defer client.Close()
+		geminiModel = client.GenerativeModel(geminiModelName)
 	}
-	defer client.Close()
-
-	// Use a model that's good at code gen and context
-	model := client.GenerativeModel("gemini-2.5-flash")
 
 	// Set up the server state
 	s := &AppServer{
-		geminiModel: model,
+		geminiModel:   geminiModel,
+		useLocalModel: *useLocalModelPtr,
 	}
 
 	// 3. Set up HTTP server
