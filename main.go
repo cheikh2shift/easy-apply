@@ -190,6 +190,7 @@ INSTRUCTIONS:
         i. Generate code to click the "Next" button (using "[data-easy-apply-next-button]").
 5.  Do NOT include javascript or any other text, just the executable JavaScript code.
 6.  If you cannot find a match for a field, omit code for it.
+7. Some fields appear to require the user clicking it for the input to be recognized, take this into account
 
 JAVASCRIPT CODE:
 `, resumeText, modalHTML)
