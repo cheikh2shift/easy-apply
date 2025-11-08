@@ -83,7 +83,8 @@ May 2014)
 `
 
 // Model configuration constants
-const localModelName = "gemma3:270m"
+var localModelName = "gemma3:270m"
+
 const geminiModelName = "gemini-2.5-flash"
 const ollamaAPIUrl = "http://localhost:11434/api/generate" // Ollama's default API endpoint
 
@@ -207,7 +208,7 @@ func (s *AppServer) aiapplyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("Received JS code from AI. Sending to client.")
+	log.Println("Received JS code from AI. Sending to client.", jsCode)
 
 	// 5. Send the JavaScript code back to the extension
 	res := AnalyzeResponse{JSCode: jsCode}
@@ -329,6 +330,12 @@ func main() {
 	// Command-line flag definition
 	useLocalModelPtr := flag.Bool("local-model", false, "Use local Ollama model (deepseek-r1) instead of Gemini.")
 	flag.Parse()
+
+	localModel := os.Getenv("LLAMA_MODEL")
+
+	if localModel != "" {
+		localModelName = localModel
+	}
 
 	// 1. Conditional Configuration
 	if !*useLocalModelPtr {
